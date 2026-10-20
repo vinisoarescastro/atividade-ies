@@ -5,6 +5,7 @@ import com.saas.billing.domain.Customer;
 import com.saas.billing.domain.Invoice;
 import com.saas.billing.domain.InvoiceStatus;
 import com.saas.billing.domain.Money;
+import com.saas.billing.domain.PricingCalculator;
 import com.saas.billing.port.CustomerRepository;
 import com.saas.billing.port.InvoiceRepository;
 import com.saas.billing.port.NotificationException;
@@ -16,6 +17,10 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 
+/**
+ * Caso de uso de cobrança mensal: orquestra precificação, pagamento,
+ * registro da fatura e notificação. Não contém regra de cálculo nem I/O direto.
+ */
 public class SubscriptionBillingService {
 
     private final CustomerRepository customerRepository;
@@ -23,6 +28,7 @@ public class SubscriptionBillingService {
     private final PaymentGateway paymentGateway;
     private final NotificationService notificationService;
     private final Clock clock;
+    private final PricingCalculator pricingCalculator = new PricingCalculator();
 
     public SubscriptionBillingService(CustomerRepository customerRepository,
                                       InvoiceRepository invoiceRepository,
@@ -37,72 +43,37 @@ public class SubscriptionBillingService {
     }
 
     public List<String> processMonthlyBilling(BillingCommand command) {
+        Money amount = pricingCalculator.calculate(command, LocalDate.now(clock));
 
+        Optional<Customer> customer = customerRepository.findById(command.customerId());
+        if (customer.isEmpty()) {
+            return new ArrayList<>();
+        }
+        if (!customer.get().isActive()) {
+            return new ArrayList<>(List.of("Cliente inativo. Cobrança cancelada: " + command.customerId()));
+        }
+        return charge(customer.get(), command.paymentCardToken(), amount);
+    }
+
+    private List<String> charge(Customer customer, String cardToken, Money amount) {
         List<String> logs = new ArrayList<>();
-        Money basePrice = command.basePrice();
+        boolean approved = paymentGateway.charge(cardToken, amount);
+        logs.add(approved
+                ? "Pagamento processado com sucesso: R$ " + amount
+                : "Falha no pagamento do cartão para: " + customer.id());
 
-        LocalDate signupDate = command.signupDate();
-        LocalDate today = LocalDate.now(clock);
+        invoiceRepository.save(new Invoice(customer.id(), amount, InvoiceStatus.fromPayment(approved)));
+        logs.add(notifyCustomer(customer, amount));
+        return logs;
+    }
 
-        int monthsActive = (today.getYear() - signupDate.getYear()) * 12 + (today.getMonthValue() - signupDate.getMonthValue());
-
-        Money calculatedPrice = basePrice;
-
-        if (monthsActive > 24) {
-            calculatedPrice = calculatedPrice.minus(basePrice.times("0.15")); // 15% após 2 anos
-        } else if (monthsActive > 12) {
-            calculatedPrice = calculatedPrice.minus(basePrice.times("0.10")); // 10% após 1 ano
-        }
-
-        if (command.nonProfit()) {
-            calculatedPrice = calculatedPrice.times("0.70"); // 30% off para ONGs
-        }
-
-        if (command.hasPromoCode()) {
-            String promoCode = command.promoCode();
-            if (promoCode.equalsIgnoreCase("BLACKFRIDAY") && today.getMonthValue() == 11) {
-                calculatedPrice = calculatedPrice.minus(Money.of("30.00"));
-            } else if (promoCode.equalsIgnoreCase("WELCOME10") && monthsActive <= 1) {
-                calculatedPrice = calculatedPrice.times("0.90");
-            }
-        }
-
-        if (command.isOverdue()) {
-            Money penalty = calculatedPrice.times("0.02");
-            Money dailyInterest = calculatedPrice.times("0.001").times(command.overdueDays());
-            calculatedPrice = calculatedPrice.plus(penalty).plus(dailyInterest);
-        }
-
-        calculatedPrice = calculatedPrice.atLeastZero();
-
-        Optional<Customer> found = customerRepository.findById(command.customerId());
-        if (found.isEmpty()) {
-            return logs;
-        }
-        Customer customer = found.get();
-
-        if (!customer.isActive()) {
-            logs.add("Cliente inativo. Cobrança cancelada: " + command.customerId());
-            return logs;
-        }
-
-        boolean paymentSuccess = paymentGateway.charge(command.paymentCardToken(), calculatedPrice);
-        if (paymentSuccess) {
-            logs.add("Pagamento processado com sucesso: R$ " + calculatedPrice);
-        } else {
-            logs.add("Falha no pagamento do cartão para: " + command.customerId());
-        }
-
-        invoiceRepository.save(new Invoice(command.customerId(), calculatedPrice, InvoiceStatus.fromPayment(paymentSuccess)));
-
+    private String notifyCustomer(Customer customer, Money amount) {
         try {
-            notificationService.sendInvoiceReceipt(customer.email(), calculatedPrice);
-            logs.add("E-mail disparado para: " + customer.email());
+            notificationService.sendInvoiceReceipt(customer.email(), amount);
+            return "E-mail disparado para: " + customer.email();
         } catch (NotificationException e) {
             // A fatura já foi gravada: falha no e-mail não pode desfazer nem repetir a cobrança.
-            logs.add("Falha ao enviar e-mail para: " + customer.email() + " (" + e.getMessage() + ")");
+            return "Falha ao enviar e-mail para: " + customer.email() + " (" + e.getMessage() + ")";
         }
-
-        return logs;
     }
 }
